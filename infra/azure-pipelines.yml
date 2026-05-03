@@ -1,0 +1,215 @@
+trigger:
+  branches:
+    include:
+    - main
+
+pr:
+  branches:
+    include:
+    - main
+
+variables:
+  vmImageName: 'ubuntu-latest'
+  artifactName: 'drop'
+  imageRepository: 'sample-aks-app'
+  dockerfilePath: 'infra/Dockerfile'
+  tag: '$(Build.BuildId)'
+
+  sonarServiceConnection: 'sonarqube-service-connection'
+  acrServiceConnection: 'acr-service-connection'
+  azureSubscription: 'azure-rm-service-connection'
+
+  acrName: 'youracrname.azurecr.io'
+  aksResourceGroup: 'rg-aks'
+  aksClusterName: 'aks-workload'
+  k8sNamespace: 'sampleapp'
+  imagePullSecret: 'acr-auth'
+
+stages:
+- stage: Build_Test_Analyze
+  displayName: Build Test Analyze
+  jobs:
+  - job: Build
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+    - checkout: self
+
+    - task: NodeTool@0
+      inputs:
+        versionSpec: '20.x'
+      displayName: Use Node.js 20
+
+    - script: |
+        cd app
+        npm install
+        npm test
+      displayName: Install and run tests
+
+    - task: CopyFiles@2
+      displayName: Copy app files to staging
+      inputs:
+        SourceFolder: '$(Build.SourcesDirectory)'
+        Contents: |
+          app/**
+          infra/**
+        TargetFolder: '$(Build.ArtifactStagingDirectory)'
+
+    - task: PublishBuildArtifacts@1
+      displayName: Publish immutable artifact
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: '$(artifactName)'
+        publishLocation: 'Container'
+
+    - task: SonarQubePrepare@7
+      displayName: Prepare SonarQube analysis
+      inputs:
+        SonarQube: '$(sonarServiceConnection)'
+        scannerMode: 'CLI'
+        configMode: 'file'
+        configFile: 'infra/sonar-project.properties'
+
+    - script: |
+        npm install -g sonarqube-scanner
+        sonar-scanner
+      displayName: Run SonarQube scan
+
+    - task: SonarQubePublish@7
+      displayName: Publish SonarQube quality gate
+      inputs:
+        pollingTimeoutSec: '300'
+
+    - script: |
+        sudo apt-get update
+        sudo apt-get install -y wget apt-transport-https gnupg lsb-release
+        wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+        echo deb https://aquasecurity.github.io/trivy-repo/deb generic main | sudo tee -a /etc/apt/sources.list.d/trivy.list
+        sudo apt-get update
+        sudo apt-get install -y trivy
+        trivy fs --exit-code 0 --severity HIGH,CRITICAL $(Build.SourcesDirectory)
+      displayName: Trivy filesystem scan
+
+    - script: |
+        curl -Lo snyk https://static.snyk.io/cli/latest/snyk-linux
+        chmod +x snyk
+        sudo mv snyk /usr/local/bin/snyk
+        snyk auth $(SNYK_TOKEN)
+        snyk test --all-projects --severity-threshold=high || true
+      displayName: Snyk code/dependency scan
+      env:
+        SNYK_TOKEN: $(SNYK_TOKEN)
+
+- stage: Docker_ACR
+  displayName: Docker Build and Push
+  dependsOn: Build_Test_Analyze
+  condition: succeeded()
+  jobs:
+  - job: Docker
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+    - task: DownloadBuildArtifacts@0
+      displayName: Download immutable artifact
+      inputs:
+        buildType: current
+        downloadType: single
+        artifactName: '$(artifactName)'
+        downloadPath: '$(Pipeline.Workspace)'
+
+    - script: |
+        ls -R $(Pipeline.Workspace)
+      displayName: Verify artifact structure
+
+    - task: Docker@2
+      displayName: Build image from artifact
+      inputs:
+        containerRegistry: '$(acrServiceConnection)'
+        repository: '$(imageRepository)'
+        command: 'build'
+        Dockerfile: '$(Pipeline.Workspace)/$(artifactName)/infra/Dockerfile'
+        buildContext: '$(Pipeline.Workspace)/$(artifactName)'
+        tags: |
+          $(tag)
+          latest
+
+    - script: |
+        sudo apt-get update
+        sudo apt-get install -y wget apt-transport-https gnupg lsb-release
+        wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+        echo deb https://aquasecurity.github.io/trivy-repo/deb generic main | sudo tee -a /etc/apt/sources.list.d/trivy.list
+        sudo apt-get update
+        sudo apt-get install -y trivy
+        trivy image --exit-code 0 --severity HIGH,CRITICAL $(acrName)/$(imageRepository):$(tag)
+      displayName: Trivy image scan
+
+    - script: |
+        snyk auth $(SNYK_TOKEN)
+        snyk container test $(acrName)/$(imageRepository):$(tag) --severity-threshold=high || true
+      displayName: Snyk container scan
+      env:
+        SNYK_TOKEN: $(SNYK_TOKEN)
+
+    - task: Docker@2
+      displayName: Push image to ACR
+      inputs:
+        containerRegistry: '$(acrServiceConnection)'
+        repository: '$(imageRepository)'
+        command: 'push'
+        tags: |
+          $(tag)
+          latest
+
+- stage: Deploy_AKS
+  displayName: Deploy to AKS
+  dependsOn: Docker_ACR
+  condition: succeeded()
+  jobs:
+  - deployment: Deploy
+    environment: 'aks-sampleapp'
+    pool:
+      vmImage: $(vmImageName)
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: DownloadBuildArtifacts@0
+            displayName: Download immutable artifact
+            inputs:
+              buildType: current
+              downloadType: single
+              artifactName: '$(artifactName)'
+              downloadPath: '$(Pipeline.Workspace)'
+
+          - task: KubernetesManifest@1
+            displayName: Create imagePullSecret
+            inputs:
+              action: createSecret
+              connectionType: azureResourceManager
+              azureSubscriptionConnection: '$(azureSubscription)'
+              azureResourceGroup: '$(aksResourceGroup)'
+              kubernetesCluster: '$(aksClusterName)'
+              namespace: '$(k8sNamespace)'
+              secretType: dockerRegistry
+              secretName: '$(imagePullSecret)'
+              dockerRegistryEndpoint: '$(acrServiceConnection)'
+
+          - task: KubernetesManifest@1
+            displayName: Deploy manifests to AKS
+            inputs:
+              action: deploy
+              connectionType: azureResourceManager
+              azureSubscriptionConnection: '$(azureSubscription)'
+              azureResourceGroup: '$(aksResourceGroup)'
+              kubernetesCluster: '$(aksClusterName)'
+              namespace: '$(k8sNamespace)'
+              manifests: |
+                $(Pipeline.Workspace)/$(artifactName)/infra/k8s/namespace.yaml
+                $(Pipeline.Workspace)/$(artifactName)/infra/k8s/deployment.yaml
+                $(Pipeline.Workspace)/$(artifactName)/infra/k8s/service.yaml
+                $(Pipeline.Workspace)/$(artifactName)/infra/k8s/ingress.yaml
+              containers: |
+                $(acrName)/$(imageRepository):$(tag)
+              imagePullSecrets: |
+                $(imagePullSecret)
+              rolloutStatusTimeout: '180'
